@@ -45,6 +45,13 @@ pub struct RunSubagentRequest {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Tenant the call belongs to. Set by the Tenant Gateway from the
+    /// authenticated bearer; never trusted from a raw client. The MCP-stdio
+    /// path leaves this `None` (single-user dev). Honeycomb stamps it onto
+    /// the `TaskRecord` for audit/scoping. See
+    /// `docs/02_architecture/18_tenant_gateway.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
 }
 
 impl RunSubagentRequest {
@@ -128,7 +135,7 @@ impl McpTools for HttpMcpTools {
         // The capability_urn carries the model identity for the scheduler's hard filter;
         // the prompt carries the workload (classify, extract, summarise, …).
         let task_id = Uuid::new_v4();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "task_id": task_id,
             "owner_id": Uuid::nil(),
             "execution_type": "llm",
@@ -144,6 +151,9 @@ impl McpTools for HttpMcpTools {
             "allowed_nodes": "hive_wide",
             "capability_urn": parse_urn(&urn)?,
         });
+        if let Some(tid) = req.tenant_id {
+            body["tenant_id"] = serde_json::Value::String(tid.to_string());
+        }
         #[derive(Deserialize)]
         struct TaskCreated { task_id: Uuid }
         let created: TaskCreated = self.client.post_json("/api/tasks/create", &body).await?;
@@ -229,6 +239,7 @@ mod tests {
             prompt: "Classify: 'great game!' as positive or negative.".into(),
             profile: Some("default".into()),
             timeout_seconds: Some(30),
+            tenant_id: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         let r2: RunSubagentRequest = serde_json::from_str(&s).unwrap();
@@ -245,6 +256,7 @@ mod tests {
             prompt: "x".into(),
             profile: None,
             timeout_seconds: None,
+            tenant_id: None,
         };
         assert_eq!(
             req.resolved_capability_urn().unwrap(),
@@ -260,6 +272,7 @@ mod tests {
             prompt: "x".into(),
             profile: None,
             timeout_seconds: None,
+            tenant_id: None,
         };
         assert_eq!(
             req.resolved_capability_urn().unwrap(),
@@ -275,6 +288,7 @@ mod tests {
             prompt: "x".into(),
             profile: None,
             timeout_seconds: None,
+            tenant_id: None,
         };
         assert!(matches!(
             req.resolved_capability_urn(),
