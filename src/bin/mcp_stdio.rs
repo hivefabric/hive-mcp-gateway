@@ -190,17 +190,26 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "run_subagent",
-                "description": "Submit a sub-agent task to HiveFabric (e.g. classify text, embed, summarize). Returns the result synchronously after the task completes or fails.",
+                "description": "Run a generic-inference task on the HiveFabric network. Pick a model (by model_id like \"qwen2.5:0.5b\" OR by full capability_urn like \"oasf://commons/inference/qwen2.5-0.5b/v1\") and send a prompt. The 'what' (classify, summarise, extract, rerank, …) lives in the prompt itself — there are no special-case workload schemas. Returns the model's response synchronously after the task completes or fails.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "model_id": {
+                            "type": "string",
+                            "description": "Canonical model identifier, e.g. \"qwen2.5:0.5b\", \"gemma:2b\", \"llama3.2:3b\". Pick one of model_id or capability_urn."
+                        },
                         "capability_urn": {
                             "type": "string",
-                            "description": "Capability URN (e.g. oasf://commons/capability/classify/v2)."
+                            "description": "Full capability URN, e.g. \"oasf://commons/inference/qwen2.5-0.5b/v1\". Pick one of model_id or capability_urn. If both are given, capability_urn wins."
                         },
-                        "input": {
-                            "type": "object",
-                            "description": "Capability-specific input payload (e.g. {\"text\":\"...\",\"labels\":[\"a\",\"b\"]} for classify)."
+                        "prompt": {
+                            "type": "string",
+                            "description": "The instruction. Encodes the workload. Examples: \"Classify: 'great game!' as positive | negative.\" or \"Summarise in one sentence: <text>\" or \"Extract entities from: <text>\"."
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "LLM profile name on the comb. Defaults to \"default\".",
+                            "default": "default"
                         },
                         "timeout_seconds": {
                             "type": "integer",
@@ -208,7 +217,7 @@ fn handle_tools_list() -> Value {
                             "default": 60
                         }
                     },
-                    "required": ["capability_urn", "input"]
+                    "required": ["prompt"]
                 }
             },
             {
