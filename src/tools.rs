@@ -130,30 +130,8 @@ impl McpTools for HttpMcpTools {
         if req.prompt.trim().is_empty() {
             return Err(GatewayError::Invalid("prompt is empty".into()));
         }
-
-        // Generic-inference shape: ExecutionType::Llm + LlmTaskPayload{profile, prompt}.
-        // The capability_urn carries the model identity for the scheduler's hard filter;
-        // the prompt carries the workload (classify, extract, summarise, …).
         let task_id = Uuid::new_v4();
-        let mut body = serde_json::json!({
-            "task_id": task_id,
-            "owner_id": Uuid::nil(),
-            "execution_type": "llm",
-            "payload": {
-                "profile": profile,
-                "prompt": req.prompt,
-            },
-            "required_capabilities": {
-                "cpu_cores": null,
-                "memory_mb": null,
-                "llm_profiles": []
-            },
-            "allowed_nodes": "hive_wide",
-            "capability_urn": parse_urn(&urn)?,
-        });
-        if let Some(tid) = req.tenant_id {
-            body["tenant_id"] = serde_json::Value::String(tid.to_string());
-        }
+        let body = build_task_create_body(task_id, &urn, &profile, &req.prompt, req.tenant_id)?;
         #[derive(Deserialize)]
         struct TaskCreated { task_id: Uuid }
         let created: TaskCreated = self.client.post_json("/api/tasks/create", &body).await?;
@@ -197,6 +175,47 @@ impl McpTools for HttpMcpTools {
             "estimate_cost requires the Honey Ledger (Phase 2)",
         ))
     }
+}
+
+/// Build the `TaskCreateRequest` JSON body the control plane expects.
+///
+/// Generic-inference shape: `ExecutionType::Llm` + `LlmTaskPayload{profile, prompt}`.
+/// The capability_urn carries the model identity for the scheduler's hard
+/// filter; the prompt carries the workload (classify, extract, summarise, …).
+///
+/// Pulled out from `run_subagent` so a unit test can assert the body
+/// round-trips through `hive_sdk::TaskCreateRequest` — that's the contract
+/// with Honeycomb's deserialiser, and a wire-format drift here silently
+/// breaks every gateway-to-Honeycomb call (regression: 2026-05-18, where
+/// `allowed_nodes: "hive_wide"` mismatched the kebab-case enum and every
+/// `run_subagent` failed at deserialisation).
+fn build_task_create_body(
+    task_id: Uuid,
+    urn: &str,
+    profile: &str,
+    prompt: &str,
+    tenant_id: Option<Uuid>,
+) -> GatewayResult<serde_json::Value> {
+    let mut body = serde_json::json!({
+        "task_id": task_id,
+        "owner_id": Uuid::nil(),
+        "execution_type": "llm",
+        "payload": {
+            "profile": profile,
+            "prompt": prompt,
+        },
+        "required_capabilities": {
+            "cpu_cores": null,
+            "memory_mb": null,
+            "llm_profiles": []
+        },
+        "allowed_nodes": "hive-wide",
+        "capability_urn": parse_urn(urn)?,
+    });
+    if let Some(tid) = tenant_id {
+        body["tenant_id"] = serde_json::Value::String(tid.to_string());
+    }
+    Ok(body)
 }
 
 /// Parse a canonical `oasf://<ns>/<domain>/<op>/v<N>` URN into the structured
@@ -313,6 +332,51 @@ mod tests {
     #[test]
     fn parse_urn_rejects_missing_version_prefix() {
         assert!(parse_urn("oasf://commons/inference/q/2").is_err());
+    }
+
+    #[test]
+    fn task_create_body_round_trips_through_hive_sdk_task_create_request() {
+        // The shape we POST to /api/tasks/create must deserialise as a
+        // `hive_sdk::TaskCreateRequest`. If this test fails, every
+        // gateway-to-Honeycomb call is silently broken in production.
+        let task_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let body = build_task_create_body(
+            task_id,
+            "oasf://commons/inference/qwen2.5-0.5b/v1",
+            "default",
+            "Classify: 'great game!'",
+            Some(tenant_id),
+        )
+        .unwrap();
+        // allowed_nodes must be the kebab-case wire form.
+        assert_eq!(body["allowed_nodes"], "hive-wide");
+        // The whole body must deserialise as the canonical request type.
+        let decoded: hive_sdk::TaskCreateRequest =
+            serde_json::from_value(body).expect("body deserialises as TaskCreateRequest");
+        assert_eq!(decoded.task_id, task_id);
+        assert_eq!(decoded.tenant_id, Some(tenant_id));
+        assert_eq!(
+            decoded.allowed_nodes,
+            hive_sdk::AllowedNodesScope::HiveWide
+        );
+        let urn = decoded.capability_urn.expect("capability_urn present");
+        assert_eq!(urn.namespace, "commons");
+        assert_eq!(urn.operation, "qwen2.5-0.5b");
+        assert_eq!(urn.version, 1);
+    }
+
+    #[test]
+    fn task_create_body_omits_tenant_id_when_none() {
+        let body = build_task_create_body(
+            Uuid::new_v4(),
+            "oasf://commons/inference/qwen2.5-0.5b/v1",
+            "default",
+            "x",
+            None,
+        )
+        .unwrap();
+        assert!(body.get("tenant_id").is_none());
     }
 
     #[tokio::test]
