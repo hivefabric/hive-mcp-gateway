@@ -1,4 +1,5 @@
 use std::time::Duration;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -177,18 +178,17 @@ impl McpTools for HttpMcpTools {
     }
 }
 
-/// Build the `TaskCreateRequest` JSON body the control plane expects.
+/// Build an `AcpEnvelope<TaskCreateRequest>` body ready to POST to Honeycomb.
 ///
-/// Generic-inference shape: `ExecutionType::Llm` + `LlmTaskPayload{profile, prompt}`.
-/// The capability_urn carries the model identity for the scheduler's hard
-/// filter; the prompt carries the workload (classify, extract, summarise, …).
+/// The envelope carries W3C traceparent (freshly minted), an idempotency key
+/// (task_id hex), and a conservative BudgetContext. Honeycomb's ingest path
+/// accepts both bare `TaskCreateRequest` (back-compat) and this envelope form;
+/// the envelope form is preferred because it propagates traceparent and budget
+/// constraints end-to-end.
 ///
 /// Pulled out from `run_subagent` so a unit test can assert the body
-/// round-trips through `hive_sdk::TaskCreateRequest` — that's the contract
-/// with Honeycomb's deserialiser, and a wire-format drift here silently
-/// breaks every gateway-to-Honeycomb call (regression: 2026-05-18, where
-/// `allowed_nodes: "hive_wide"` mismatched the kebab-case enum and every
-/// `run_subagent` failed at deserialisation).
+/// round-trips through `hive_sdk::AcpEnvelope<TaskCreateRequest>` — that's the
+/// contract with Honeycomb's deserialiser.
 fn build_task_create_body(
     task_id: Uuid,
     urn: &str,
@@ -196,7 +196,8 @@ fn build_task_create_body(
     prompt: &str,
     tenant_id: Option<Uuid>,
 ) -> GatewayResult<serde_json::Value> {
-    let mut body = serde_json::json!({
+    let capability_urn = parse_urn(urn)?;
+    let mut inner = serde_json::json!({
         "task_id": task_id,
         "owner_id": Uuid::nil(),
         "execution_type": "llm",
@@ -210,12 +211,40 @@ fn build_task_create_body(
             "llm_profiles": []
         },
         "allowed_nodes": "hive-wide",
-        "capability_urn": parse_urn(urn)?,
+        "capability_urn": capability_urn,
     });
     if let Some(tid) = tenant_id {
-        body["tenant_id"] = serde_json::Value::String(tid.to_string());
+        inner["tenant_id"] = serde_json::Value::String(tid.to_string());
     }
-    Ok(body)
+
+    let traceparent = mint_traceparent(task_id);
+    let origin_user_id = tenant_id.unwrap_or_else(Uuid::nil);
+    // Conservative Phase-1 budget: 4K tokens each way, 1000 credits, 60 s TTL.
+    let deadline = Utc::now() + chrono::Duration::seconds(60);
+    let envelope = serde_json::json!({
+        "task_id": task_id,
+        "traceparent": traceparent,
+        "idempotency_key": task_id.simple().to_string(),
+        "budget_context": {
+            "input_tokens_remaining": 4096_i64,
+            "output_tokens_remaining": 4096_i64,
+            "credits_remaining": 1000_i64,
+            "spawn_depth_remaining": 4_u32,
+            "wall_clock_deadline": deadline.to_rfc3339(),
+        },
+        "origin_user_id": origin_user_id,
+        "payload": inner,
+    });
+    Ok(envelope)
+}
+
+/// Mint a W3C traceparent for a known task_id.
+/// Format: `00-{trace_id_32hex}-{span_id_16hex}-01`
+fn mint_traceparent(task_id: Uuid) -> String {
+    let trace_id = task_id.simple().to_string();
+    let span = Uuid::new_v4().simple().to_string();
+    let span_id = &span[0..16];
+    format!("00-{trace_id}-{span_id}-01")
 }
 
 /// Parse a canonical `oasf://<ns>/<domain>/<op>/v<N>` URN into the structured
@@ -335,10 +364,11 @@ mod tests {
     }
 
     #[test]
-    fn task_create_body_round_trips_through_hive_sdk_task_create_request() {
-        // The shape we POST to /api/tasks/create must deserialise as a
-        // `hive_sdk::TaskCreateRequest`. If this test fails, every
-        // gateway-to-Honeycomb call is silently broken in production.
+    fn task_create_body_is_valid_acp_envelope_for_honeycomb() {
+        // The shape we POST to /api/tasks/create must deserialise as an
+        // `AcpEnvelope<TaskCreateRequest>`. Honeycomb tries the envelope form
+        // first; if this test breaks every gateway call silently degrades to the
+        // back-compat bare-request path and loses traceparent + budget context.
         let task_id = Uuid::new_v4();
         let tenant_id = Uuid::new_v4();
         let body = build_task_create_body(
@@ -349,25 +379,32 @@ mod tests {
             Some(tenant_id),
         )
         .unwrap();
-        // allowed_nodes must be the kebab-case wire form.
-        assert_eq!(body["allowed_nodes"], "hive-wide");
-        // The whole body must deserialise as the canonical request type.
-        let decoded: hive_sdk::TaskCreateRequest =
-            serde_json::from_value(body).expect("body deserialises as TaskCreateRequest");
-        assert_eq!(decoded.task_id, task_id);
-        assert_eq!(decoded.tenant_id, Some(tenant_id));
-        assert_eq!(
-            decoded.allowed_nodes,
-            hive_sdk::AllowedNodesScope::HiveWide
-        );
-        let urn = decoded.capability_urn.expect("capability_urn present");
+
+        // Must round-trip through AcpEnvelope<TaskCreateRequest>.
+        let envelope: hive_sdk::AcpEnvelope<hive_sdk::TaskCreateRequest> =
+            serde_json::from_value(body.clone())
+                .expect("body deserialises as AcpEnvelope<TaskCreateRequest>");
+        assert_eq!(envelope.task_id, task_id);
+        assert!(envelope.traceparent.starts_with("00-"), "traceparent in W3C format");
+
+        // Inner payload must be a valid TaskCreateRequest.
+        let inner = envelope.payload;
+        assert_eq!(inner.task_id, task_id);
+        assert_eq!(inner.tenant_id, Some(tenant_id));
+        assert_eq!(inner.allowed_nodes, hive_sdk::AllowedNodesScope::HiveWide);
+        let urn = inner.capability_urn.expect("capability_urn present");
         assert_eq!(urn.namespace, "commons");
         assert_eq!(urn.operation, "qwen2.5-0.5b");
         assert_eq!(urn.version, 1);
+
+        // Budget context must have sane defaults.
+        assert!(envelope.budget_context.credits_remaining > 0);
+        assert!(envelope.budget_context.spawn_depth_remaining > 0);
+        assert!(envelope.budget_context.wall_clock_deadline > chrono::Utc::now());
     }
 
     #[test]
-    fn task_create_body_omits_tenant_id_when_none() {
+    fn task_create_body_inner_omits_tenant_id_when_none() {
         let body = build_task_create_body(
             Uuid::new_v4(),
             "oasf://commons/inference/qwen2.5-0.5b/v1",
@@ -376,7 +413,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(body.get("tenant_id").is_none());
+        // tenant_id absent in the inner payload.
+        assert!(body["payload"].get("tenant_id").is_none());
     }
 
     #[tokio::test]
