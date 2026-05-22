@@ -53,6 +53,15 @@ pub struct RunSubagentRequest {
     /// `docs/02_architecture/18_tenant_gateway.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
+    /// Sensitivity tier required for this task. Injected by the Tenant Gateway
+    /// from the tenant's plan; overridden by the gateway — not accepted from
+    /// the raw caller body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity_required: Option<String>,
+    /// Jurisdiction tags the executing comb must satisfy. Injected by the
+    /// Tenant Gateway from the tenant's data-residency settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jurisdiction_required: Vec<String>,
 }
 
 impl RunSubagentRequest {
@@ -132,7 +141,15 @@ impl McpTools for HttpMcpTools {
             return Err(GatewayError::Invalid("prompt is empty".into()));
         }
         let task_id = Uuid::new_v4();
-        let body = build_task_create_body(task_id, &urn, &profile, &req.prompt, req.tenant_id)?;
+        let body = build_task_create_body(
+            task_id,
+            &urn,
+            &profile,
+            &req.prompt,
+            req.tenant_id,
+            req.sensitivity_required.clone(),
+            req.jurisdiction_required.clone(),
+        )?;
         #[derive(Deserialize)]
         struct TaskCreated { task_id: Uuid }
         let created: TaskCreated = self.client.post_json("/api/tasks/create", &body).await?;
@@ -195,6 +212,8 @@ fn build_task_create_body(
     profile: &str,
     prompt: &str,
     tenant_id: Option<Uuid>,
+    sensitivity_required: Option<String>,
+    jurisdiction_required: Vec<String>,
 ) -> GatewayResult<serde_json::Value> {
     let capability_urn = parse_urn(urn)?;
     let mut inner = serde_json::json!({
@@ -215,6 +234,13 @@ fn build_task_create_body(
     });
     if let Some(tid) = tenant_id {
         inner["tenant_id"] = serde_json::Value::String(tid.to_string());
+    }
+    if let Some(sens) = sensitivity_required {
+        inner["sensitivity_required"] = serde_json::Value::String(sens);
+    }
+    if !jurisdiction_required.is_empty() {
+        inner["jurisdiction_required"] = serde_json::to_value(jurisdiction_required)
+            .unwrap_or(serde_json::Value::Array(vec![]));
     }
 
     let traceparent = mint_traceparent(task_id);
@@ -288,6 +314,8 @@ mod tests {
             profile: Some("default".into()),
             timeout_seconds: Some(30),
             tenant_id: None,
+            sensitivity_required: None,
+            jurisdiction_required: Vec::new(),
         };
         let s = serde_json::to_string(&req).unwrap();
         let r2: RunSubagentRequest = serde_json::from_str(&s).unwrap();
@@ -305,6 +333,8 @@ mod tests {
             profile: None,
             timeout_seconds: None,
             tenant_id: None,
+            sensitivity_required: None,
+            jurisdiction_required: Vec::new(),
         };
         assert_eq!(
             req.resolved_capability_urn().unwrap(),
@@ -321,6 +351,8 @@ mod tests {
             profile: None,
             timeout_seconds: None,
             tenant_id: None,
+            sensitivity_required: None,
+            jurisdiction_required: Vec::new(),
         };
         assert_eq!(
             req.resolved_capability_urn().unwrap(),
@@ -337,6 +369,8 @@ mod tests {
             profile: None,
             timeout_seconds: None,
             tenant_id: None,
+            sensitivity_required: None,
+            jurisdiction_required: Vec::new(),
         };
         assert!(matches!(
             req.resolved_capability_urn(),
@@ -377,6 +411,8 @@ mod tests {
             "default",
             "Classify: 'great game!'",
             Some(tenant_id),
+            None,
+            Vec::new(),
         )
         .unwrap();
 
@@ -411,10 +447,34 @@ mod tests {
             "default",
             "x",
             None,
+            None,
+            Vec::new(),
         )
         .unwrap();
         // tenant_id absent in the inner payload.
         assert!(body["payload"].get("tenant_id").is_none());
+    }
+
+    #[test]
+    fn task_create_body_threads_sensitivity_and_jurisdiction() {
+        let body = build_task_create_body(
+            Uuid::new_v4(),
+            "oasf://commons/inference/qwen2.5-0.5b/v1",
+            "default",
+            "Classify: 'great game!'",
+            None,
+            Some("semi_private".to_string()),
+            vec!["eu-gdpr".to_string()],
+        )
+        .unwrap();
+        let envelope: hive_sdk::AcpEnvelope<hive_sdk::TaskCreateRequest> =
+            serde_json::from_value(body).unwrap();
+        let inner = envelope.payload;
+        assert_eq!(
+            inner.sensitivity_required,
+            Some(hive_sdk::Sensitivity::SemiPrivate)
+        );
+        assert_eq!(inner.jurisdiction_required, vec!["eu-gdpr".to_string()]);
     }
 
     #[tokio::test]
