@@ -62,6 +62,11 @@ pub struct RunSubagentRequest {
     /// Tenant Gateway from the tenant's data-residency settings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jurisdiction_required: Vec<String>,
+    /// Credits budget to embed in the ACP envelope's BudgetContext. Set by
+    /// the Tenant Gateway from the ledger balance after the pre-call debit;
+    /// defaults to a conservative fallback when the ledger is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_budget: Option<i64>,
 }
 
 impl RunSubagentRequest {
@@ -149,6 +154,7 @@ impl McpTools for HttpMcpTools {
             req.tenant_id,
             req.sensitivity_required.clone(),
             req.jurisdiction_required.clone(),
+            req.credits_budget,
         )?;
         #[derive(Deserialize)]
         struct TaskCreated { task_id: Uuid }
@@ -214,6 +220,7 @@ fn build_task_create_body(
     tenant_id: Option<Uuid>,
     sensitivity_required: Option<String>,
     jurisdiction_required: Vec<String>,
+    credits_budget: Option<i64>,
 ) -> GatewayResult<serde_json::Value> {
     let capability_urn = parse_urn(urn)?;
     let mut inner = serde_json::json!({
@@ -245,8 +252,10 @@ fn build_task_create_body(
 
     let traceparent = mint_traceparent(task_id);
     let origin_user_id = tenant_id.unwrap_or_else(Uuid::nil);
-    // Conservative Phase-1 budget: 4K tokens each way, 1000 credits, 60 s TTL.
     let deadline = Utc::now() + chrono::Duration::seconds(60);
+    // Use caller-supplied balance (post-debit) when available; fall back to a
+    // conservative default so dev/MCP-stdio paths still get a valid envelope.
+    let credits = credits_budget.unwrap_or(1_000);
     let envelope = serde_json::json!({
         "task_id": task_id,
         "traceparent": traceparent,
@@ -254,7 +263,7 @@ fn build_task_create_body(
         "budget_context": {
             "input_tokens_remaining": 4096_i64,
             "output_tokens_remaining": 4096_i64,
-            "credits_remaining": 1000_i64,
+            "credits_remaining": credits,
             "spawn_depth_remaining": 4_u32,
             "wall_clock_deadline": deadline.to_rfc3339(),
         },
@@ -316,6 +325,7 @@ mod tests {
             tenant_id: None,
             sensitivity_required: None,
             jurisdiction_required: Vec::new(),
+            credits_budget: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         let r2: RunSubagentRequest = serde_json::from_str(&s).unwrap();
@@ -335,6 +345,7 @@ mod tests {
             tenant_id: None,
             sensitivity_required: None,
             jurisdiction_required: Vec::new(),
+            credits_budget: None,
         };
         assert_eq!(
             req.resolved_capability_urn().unwrap(),
@@ -353,6 +364,7 @@ mod tests {
             tenant_id: None,
             sensitivity_required: None,
             jurisdiction_required: Vec::new(),
+            credits_budget: None,
         };
         assert_eq!(
             req.resolved_capability_urn().unwrap(),
@@ -371,6 +383,7 @@ mod tests {
             tenant_id: None,
             sensitivity_required: None,
             jurisdiction_required: Vec::new(),
+            credits_budget: None,
         };
         assert!(matches!(
             req.resolved_capability_urn(),
@@ -413,6 +426,7 @@ mod tests {
             Some(tenant_id),
             None,
             Vec::new(),
+            Some(500),
         )
         .unwrap();
 
@@ -449,6 +463,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .unwrap();
         // tenant_id absent in the inner payload.
@@ -465,6 +480,7 @@ mod tests {
             None,
             Some("semi_private".to_string()),
             vec!["eu-gdpr".to_string()],
+            None,
         )
         .unwrap();
         let envelope: hive_sdk::AcpEnvelope<hive_sdk::TaskCreateRequest> =
@@ -475,6 +491,38 @@ mod tests {
             Some(hive_sdk::Sensitivity::SemiPrivate)
         );
         assert_eq!(inner.jurisdiction_required, vec!["eu-gdpr".to_string()]);
+    }
+
+    #[test]
+    fn task_create_body_credits_budget_overrides_default() {
+        let body = build_task_create_body(
+            Uuid::new_v4(),
+            "oasf://commons/inference/qwen2.5-0.5b/v1",
+            "default",
+            "x",
+            None,
+            None,
+            Vec::new(),
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(body["budget_context"]["credits_remaining"], 42);
+    }
+
+    #[test]
+    fn task_create_body_credits_budget_defaults_to_1000_when_none() {
+        let body = build_task_create_body(
+            Uuid::new_v4(),
+            "oasf://commons/inference/qwen2.5-0.5b/v1",
+            "default",
+            "x",
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(body["budget_context"]["credits_remaining"], 1000);
     }
 
     #[tokio::test]
