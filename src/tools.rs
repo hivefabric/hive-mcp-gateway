@@ -194,10 +194,41 @@ impl McpTools for HttpMcpTools {
         }
     }
 
-    async fn estimate_cost(&self, _req: EstimateCostRequest) -> GatewayResult<EstimateCostResponse> {
-        Err(GatewayError::Unsupported(
-            "estimate_cost requires the Honey Ledger (Phase 2)",
-        ))
+    async fn estimate_cost(&self, req: EstimateCostRequest) -> GatewayResult<EstimateCostResponse> {
+        // Phase 1 estimate: credits-per-1k-tokens derived from capability URN.
+        // Business model §2: 1 credit = 1 second on a mid-tier 7B CPU comb.
+        // Estimated throughput: 7B CPU = 50 tok/s → 20 credits/1k tokens;
+        //                       70B CPU = 10 tok/s → 100 credits/1k tokens;
+        //                       7B GPU = 200 tok/s → 5 credits/1k tokens.
+        // Flat-rate capabilities (code/exec, web/search) return a job-level estimate.
+        let urn = req.capability_urn.to_lowercase();
+        let (credits_per_1k, category) = if urn.contains("70b") {
+            (100u64, "inference/70b-cpu")
+        } else if urn.contains("13b") {
+            (30, "inference/13b-cpu")
+        } else if urn.contains("gpu") {
+            (5, "inference/7b-gpu")
+        } else if urn.contains("/code/") || urn.contains("/exec/") {
+            (2000, "code/exec") // ~2 credits/job; use 1k-token base → 2 credits/call
+        } else if urn.contains("/web/") || urn.contains("/search/") {
+            (5000, "web/search") // 5 credits/call
+        } else {
+            (20, "inference/7b-cpu")
+        };
+
+        let credits = ((req.input_size_tokens.saturating_mul(credits_per_1k)) + 999) / 1000;
+        let credits = credits.max(1);
+
+        Ok(EstimateCostResponse {
+            credits_estimate: credits,
+            multipliers_applied: serde_json::json!({
+                "capability_urn": req.capability_urn,
+                "category": category,
+                "credits_per_1k_tokens": credits_per_1k,
+                "input_size_tokens": req.input_size_tokens,
+                "note": "Phase 1 estimate — based on model size from URN, not profiled benchmarks"
+            }),
+        })
     }
 }
 
@@ -526,15 +557,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn estimate_cost_returns_unsupported_until_ledger_lands() {
+    async fn estimate_cost_returns_credits_based_on_urn() {
         let tools = HttpMcpTools::new(HoneycombClient::new("http://localhost:1", None));
-        let req = EstimateCostRequest {
-            capability_urn: "oasf://commons/inference/qwen2.5-0.5b/v1".into(),
-            input_size_tokens: 1000,
-        };
-        match tools.estimate_cost(req).await {
-            Err(GatewayError::Unsupported(msg)) => assert!(msg.contains("Honey Ledger")),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        // 7B CPU model: 20 credits/1k tokens → 1000 tokens = 20 credits
+        let resp = tools
+            .estimate_cost(EstimateCostRequest {
+                capability_urn: "oasf://commons/inference/qwen2.5-0.5b/v1".into(),
+                input_size_tokens: 1000,
+            })
+            .await
+            .expect("estimate should succeed");
+        assert_eq!(resp.credits_estimate, 20);
+
+        // 70B model: 100 credits/1k tokens → 500 tokens = 50 credits
+        let resp70b = tools
+            .estimate_cost(EstimateCostRequest {
+                capability_urn: "oasf://commons/inference/llama3-70b/v1".into(),
+                input_size_tokens: 500,
+            })
+            .await
+            .expect("estimate should succeed");
+        assert_eq!(resp70b.credits_estimate, 50);
+
+        // Minimum 1 credit even for tiny inputs
+        let resp_min = tools
+            .estimate_cost(EstimateCostRequest {
+                capability_urn: "oasf://commons/inference/qwen2.5-0.5b/v1".into(),
+                input_size_tokens: 1,
+            })
+            .await
+            .expect("estimate should succeed");
+        assert_eq!(resp_min.credits_estimate, 1);
     }
 }
