@@ -67,6 +67,12 @@ pub struct RunSubagentRequest {
     /// defaults to a conservative fallback when the ledger is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_budget: Option<i64>,
+    /// LLM provider config for the queen orchestrator (session mode).
+    /// When set, the queen comb uses this LLM without needing its own API key.
+    /// Injected by the Tenant Gateway from the tenant's stored default provider.
+    /// For development: lets the queen use the same LLM the user already configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queen_llm: Option<hive_sdk::frontier::LlmProviderConfig>,
 }
 
 impl RunSubagentRequest {
@@ -146,7 +152,7 @@ impl McpTools for HttpMcpTools {
             return Err(GatewayError::Invalid("prompt is empty".into()));
         }
         let task_id = Uuid::new_v4();
-        let body = build_task_create_body(
+        let body = build_task_create_body_with_queen_llm(
             task_id,
             &urn,
             &profile,
@@ -155,6 +161,7 @@ impl McpTools for HttpMcpTools {
             req.sensitivity_required.clone(),
             req.jurisdiction_required.clone(),
             req.credits_budget,
+            req.queen_llm.as_ref(),
         )?;
         #[derive(Deserialize)]
         struct TaskCreated { task_id: Uuid }
@@ -253,15 +260,40 @@ fn build_task_create_body(
     jurisdiction_required: Vec<String>,
     credits_budget: Option<i64>,
 ) -> GatewayResult<serde_json::Value> {
+    build_task_create_body_with_queen_llm(
+        task_id, urn, profile, prompt, tenant_id,
+        sensitivity_required, jurisdiction_required, credits_budget, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_task_create_body_with_queen_llm(
+    task_id: Uuid,
+    urn: &str,
+    profile: &str,
+    prompt: &str,
+    tenant_id: Option<Uuid>,
+    sensitivity_required: Option<String>,
+    jurisdiction_required: Vec<String>,
+    credits_budget: Option<i64>,
+    queen_llm: Option<&hive_sdk::frontier::LlmProviderConfig>,
+) -> GatewayResult<serde_json::Value> {
     let capability_urn = parse_urn(urn)?;
+    let mut payload_obj = serde_json::json!({
+        "profile": profile,
+        "prompt": prompt,
+    });
+    // Inject queen LLM config so the queen comb doesn't need its own API key.
+    if let Some(llm) = queen_llm {
+        if let Ok(v) = serde_json::to_value(llm) {
+            payload_obj["queen_llm"] = v;
+        }
+    }
     let mut inner = serde_json::json!({
         "task_id": task_id,
         "owner_id": Uuid::nil(),
         "execution_type": "llm",
-        "payload": {
-            "profile": profile,
-            "prompt": prompt,
-        },
+        "payload": payload_obj,
         "required_capabilities": {
             "cpu_cores": null,
             "memory_mb": null,
