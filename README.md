@@ -1,66 +1,57 @@
 # hive-mcp-gateway
 
-The L5 Orchestrator Facade for HiveFabric. This crate exposes Honeycomb
-capabilities to LLM orchestrators (Claude, GPT, Gemini) via the
-[Model Context Protocol](https://modelcontextprotocol.io/).
+MCP (Model Context Protocol) gateway crate for HiveFabric. Exposes Honeycomb's dispatch capability as tool-callable functions. Used in two modes:
 
-## What this crate is
+1. **Library** — consumed by `hive-tenant-gateway` to back `describe_cluster`, `run_subagent`, and `estimate_cost` tool calls.
+2. **Binary** (`mcp_stdio`) — standalone stdio MCP server for direct use with Claude Desktop or any MCP-compatible client.
 
-`hive-mcp-gateway` is the *adapter* layer that translates MCP tool calls into
-calls against the Honeycomb control plane. v1 targets Honeycomb's HTTP REST
-API; Phase 2 will add a NATS-backed alternative behind the same trait so the
-gateway can be co-located with comb-level brokers.
+---
 
-> **Note:** the actual MCP wire-protocol layer (stdio / JSON-RPC server) is
-> **deferred**. This scaffold ships the adapter — `McpTools` trait,
-> request/response types, and an HTTP-backed implementation. An MCP server
-> harness comes next, likely via the [`rmcp`](https://crates.io/crates/rmcp)
-> crate or hand-rolled over stdio.
+## Tools
 
-## v1 tools
+| Tool | Description |
+|---|---|
+| `describe_cluster` | Lists capability URNs advertised by online combs. |
+| `run_subagent` | Submits a task to Honeycomb and polls until completion. Returns output + status. |
+| `estimate_cost` | Estimates credits for a task based on the capability URN category and token count. |
 
-| Tool | Purpose | Status |
-| --- | --- | --- |
-| `describe_cluster` | List capabilities, online nodes, latency. | Stub — needs Honeycomb `/api/capabilities` (Batch 2.2). |
-| `run_subagent` | Submit a single capability invocation and poll until terminal. | Wired against existing `/api/tasks/create` + `/api/tasks/{id}`. |
-| `estimate_cost` | Estimate credit cost for an input size. | Stub — needs Honeycomb `/api/costs/estimate` (Batch 2.2). |
+---
 
-Stubbed tools currently return `GatewayError::Unsupported` and will be
-unblocked once URN-native routing lands in Batch 2.2.
-
-## Phase 2 plan
-
-- `run_subagent_batch` — fan-out to multiple capabilities, gather results.
-- `get_balance` — read tenant credit balance once the Ledger service exists.
-- NATS-backed transport so the gateway can sit beside a comb broker instead
-  of going through the central HTTP API.
-
-## Wiring
+## How to use (library mode)
 
 ```rust
-use hive_mcp_gateway::{HoneycombClient, McpTools};
-use hive_mcp_gateway::tools::HttpMcpTools;
+use hive_mcp_gateway::{HttpMcpTools, HoneycombClient, tools::McpTools};
 
-let client = HoneycombClient::new("http://localhost:8080", None);
+let client = HoneycombClient::new("http://localhost:8080", Some("api-key".into()));
 let tools = HttpMcpTools::new(client);
 let cluster = tools.describe_cluster().await?;
 ```
 
-## Quickstart
+## How to run (stdio MCP server)
 
 ```bash
-# from honeycomb/mcp-gateway
-cargo check
-cargo test
-cargo clippy --all-targets -- -D warnings
+HONEYCOMB_URL=http://localhost:8080 \
+HONEYCOMB_API_KEY=dev-hive-key \
+cargo run --bin mcp_stdio
 ```
 
-To exercise `run_subagent` against a local Honeycomb, start the
-`honeycomb/service` crate first and point `HoneycombClient::new` at its bind
-address.
+## How to test
 
-## Layout
+```bash
+cargo test -p hive-mcp-gateway   # 19+ unit tests, no live server needed
+```
 
-This crate stands alone — it is **not** a member of any workspace. The sibling
-`honeycomb/service/` crate has its own `Cargo.toml`; the two are independent
-peer projects under the `honeycomb/` directory.
+---
+
+## Architecture notes
+
+- `run_subagent` polls `GET /api/tasks/{id}` every 500ms until terminal status. No WebSocket streaming yet (Phase 2).
+- Task bodies are wrapped in ACP envelopes with W3C traceparent and idempotency keys.
+- `estimate_cost` is a pure calculation — no API call. Tiers: tiny (135M-360M) = 5 credits/1k, small (0.5B-3B) = 20 credits/1k, large (7B-14B) = 40-100 credits/1k.
+- Sensitivity and jurisdiction fields are injected by `hive-tenant-gateway`; this crate passes them through.
+
+## What's not yet implemented
+
+- WebSocket streaming for `run_subagent` (currently polls; Phase 2)
+- Token-usage-based pricing (currently URN-tier estimate)
+- Budget enforcement beyond passing credits_budget through to Honeycomb
