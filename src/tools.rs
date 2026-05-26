@@ -1,7 +1,7 @@
 use std::time::Duration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use uuid::{uuid, Uuid};
 
 use crate::{GatewayError, GatewayResult, HoneycombClient};
 
@@ -314,7 +314,11 @@ fn build_task_create_body_with_queen_llm(
     }
 
     let traceparent = mint_traceparent(task_id);
-    let origin_user_id = tenant_id.unwrap_or_else(Uuid::nil);
+    // Use tenant_id as the user identity. For direct/dev paths without a tenant,
+    // use a fixed "system" sentinel UUID rather than nil (nil UUIDs are ambiguous
+    // and can bypass attribution checks).
+    const SYSTEM_USER_ID: Uuid = uuid::uuid!("00000000-0000-0000-0000-000000000001");
+    let origin_user_id = tenant_id.unwrap_or(SYSTEM_USER_ID);
     let deadline = Utc::now() + chrono::Duration::seconds(60);
     // Use caller-supplied balance (post-debit) when available; fall back to a
     // conservative default so dev/MCP-stdio paths still get a valid envelope.
