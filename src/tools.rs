@@ -18,11 +18,15 @@ pub struct CapabilityInfo {
     pub latency_p50_ms: u32,
     pub min_tier_band: String,
     pub lifecycle: String,
+    #[serde(default)]
+    pub online_combs: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeClusterResponse {
     pub capabilities: Vec<CapabilityInfo>,
+    #[serde(default)]
+    pub online_combs: usize,
 }
 
 /// The MCP `run_subagent` tool. Generic-inference shape:
@@ -139,9 +143,17 @@ impl McpTools for HttpMcpTools {
         struct CapabilitiesResponse {
             capabilities: Vec<CapabilityInfo>,
         }
+        #[derive(Deserialize, Default)]
+        struct NodeView {
+            #[serde(default)]
+            online: bool,
+        }
         let resp: CapabilitiesResponse = self.client.get_json("/api/capabilities").await?;
+        let nodes: Vec<NodeView> = self.client.get_json("/api/nodes").await.unwrap_or_default();
+        let online_combs = nodes.iter().filter(|n| n.online).count();
         Ok(DescribeClusterResponse {
             capabilities: resp.capabilities,
+            online_combs,
         })
     }
 
