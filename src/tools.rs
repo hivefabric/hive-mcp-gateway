@@ -39,7 +39,7 @@ pub struct DescribeClusterResponse {
 ///   required; if both are given, `capability_urn` wins.
 /// - Optional `profile` names the comb-side LLM profile (defaults to
 ///   `"default"`); optional `timeout_seconds` (defaults to 60).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunSubagentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
